@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="hty@19.tcp.vip.cpolar.cn:14985 password" exclude=".svn;.cvs;.idea;.DS_Store;.git;.hg;*.hprof;" remoteFilesAllowedToDisappearOnAutoupload="false" autoUploadExternalChanges="true">
+    <serverData>
+      <paths name="hty@19.tcp.vip.cpolar.cn:14985 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data0/tianyu/code/IMJENSE" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="hty@19.tcp.vip.cpolar.cn:14985 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data0/tianyu/code/IMJENSE" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="hty@19.tcp.vip.cpolar.cn:14985 password (3)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data0/tianyu/code/IMJENSE" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
