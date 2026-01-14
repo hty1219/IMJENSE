@@ -18,6 +18,7 @@ import os
 from numpy import fft
 import torch
 from skimage.metrics import structural_similarity as compute_ssim
+from skimage.metrics import peak_signal_noise_ratio as compute_psnr
 from skimage.io import imsave
 from scipy.io import loadmat
 import utils
@@ -27,22 +28,22 @@ from datetime import datetime
 import matplotlib.pyplot as plt
 import math
 
-os.environ["CUDA_VISIBLE_DEVICES"] = '6'
+#os.environ["CUDA_VISIBLE_DEVICES"] = '6'
 DEVICE = torch.device('cuda:{}'.format(str(0) if torch.cuda.is_available() else 'cpu'))
 
 data_root = '/data0/shanghong/data/fastmri_knee_mc/multicoil_train/'
-"""
+
 file_list_knee = [
     'file1000003.h5', 'file1000005.h5', 'file1000010.h5', 'file1000012.h5',
     'file1000021.h5', 'file1000032.h5', 'file1000040.h5', 'file1000043.h5',
     'file1000045.h5', 'file1000048.h5', 'file1000058.h5', 'file1000061.h5',
     'file1000069.h5', 'file1000075.h5', 'file1000084.h5', 'file1000086.h5',
-    'file1000089.h5', 'file1000098.h5', 'file1000101.h5', 'file1000109.h5'
+    'file1000089.h5', 'file1000098.h5', 'file1000101.h5', 'file1000109.h5',
+    'file1000111.h5', 'file1000117.h5', 'file1000131.h5', 'file1000141.h5',
+    'file1000149.h5', 'file1000170.h5', 'file1000172.h5', 'file1000176.h5'
+
 ]
-"""
-file_list_knee = [
-    'file1000003.h5','file1000005.h5',
-]
+
 
 file_paths = [os.path.join(data_root, f) for f in file_list_knee]
 print(f"Total files to process: {len(file_paths)}")
@@ -69,6 +70,9 @@ for idx, fname in enumerate(file_list_knee):
     try:
         # Load data
         f = h5.File(fpath, 'r')
+        vol_max = f.attrs.get('max')
+        if vol_max is None:
+            vol_max = f['max'][()] if 'max' in f else None
         if 'KspOrg' in f:
             data_cpl = f['KspOrg'][:]
         elif 'kspace' in f:
@@ -87,16 +91,33 @@ for idx, fname in enumerate(file_list_knee):
         _, current_h, current_w = img_temp.shape
         target_size = 320
 
+        pad_h = max(0, target_size - current_h)
+        pad_w = max(0, target_size - current_w)
+
+        if pad_h > 0 or pad_w > 0:
+            pad_top = pad_h // 2
+            pad_bottom = pad_h - pad_top
+            pad_left = pad_w // 2
+            pad_right = pad_w - pad_left
+
+            img_temp = np.pad(img_temp,
+                              ((0, 0), (pad_top, pad_bottom), (pad_left, pad_right)),
+                              mode='reflect')
+            print(f"Padded image from {current_h}x{current_w} to {img_temp.shape[1]}x{img_temp.shape[2]}")
+
+            _, current_h, current_w = img_temp.shape
+
         if current_h >= target_size and current_w >= target_size:
             cx, cy = current_h // 2, current_w // 2
             start_x = cx - target_size // 2
             start_y = cy - target_size // 2
             img_crop = img_temp[:, start_x:start_x + target_size, start_y:start_y + target_size]
 
+            # 4. Transform back to K-space
             data_cpl = fft.fftshift(fft.fft2(fft.fftshift(img_crop, axes=(-1, -2)), axes=(-1, -2)), axes=(-1, -2))
-            print(f"Cropped data to {target_size}x{target_size}. New shape: {data_cpl.shape}")
+            print(f"Processed data (Pad/Crop) to {target_size}x{target_size}. New shape: {data_cpl.shape}")
         else:
-            print(f"Warning: Image size ({current_h}x{current_w}) is smaller than target 320x320. Skipping crop.")
+            print(f"Warning: Image size handling skipped. Shape: {img_temp.shape}")
 
         Nchl, Nrd, Npe = data_cpl.shape
 
@@ -104,7 +125,7 @@ for idx, fname in enumerate(file_list_knee):
         Rx = 1
         Ry = 4
         num_ACSx = Nrd
-        num_ACSy = 24
+        num_ACSy = 26
         w0 = 31
         lamda = 3.8
         fn = lambda x: utils.normalize01(np.abs(x))
@@ -112,6 +133,7 @@ for idx, fname in enumerate(file_list_knee):
         # Calculate GT
         img_all = fft.fftshift(fft.ifft2(fft.fftshift(data_cpl, axes=(-1, -2)), axes=(-1, -2)), axes=(-1, -2))
         gt = np.sqrt(np.sum(np.abs(img_all) ** 2, 0))
+        print(gt.shape)
 
         # Undersampling
         tstKsp = data_cpl.transpose(1, 2, 0)
@@ -133,11 +155,17 @@ for idx, fname in enumerate(file_list_knee):
         time_end = time.time()
         print(f'Recon time: {(time_end - time_start) / 60:.2f} mins')
 
-        # Metrics
-        normOrg = fn(gt)
-        normRec = fn(pre_img_sos)
+        if vol_max is not None:
+            normOrg = np.abs(gt) / vol_max
+            normRec = np.abs(pre_img_sos * NormFactor) / vol_max
+            print(f"Using Volume Max for metrics: {vol_max}")
+        else:
+            print("Warning: Volume Max not found, using slice-wise normalization.")
+            normOrg = fn(gt)
+            normRec = fn(pre_img_sos)
 
-        psnrRec = utils.myPSNR(normOrg, normRec)
+        #psnrRec = utils.myPSNR(normOrg, normRec)
+        psnrRec = compute_psnr(normOrg, normRec, data_range=1)
         ssimRec = compute_ssim(normRec, normOrg, data_range=1, gaussian_weights=True)
         nmseRec = np.sum((normOrg - normRec) ** 2) / np.sum(normOrg ** 2)
 
@@ -150,7 +178,7 @@ for idx, fname in enumerate(file_list_knee):
         # Save results
         base_name = os.path.splitext(fname)[0]
         fig_comp, axes_comp = plt.subplots(3, 1, figsize=(6, 15))
-        im_rec = axes_comp[0].imshow(normRec, cmap='gray', vmin=0, vmax=1)
+        im_rec = axes_comp[0].imshow(normRec, cmap='gray', vmin=0, vmax=1 if vol_max is None else normOrg.max())
         axes_comp[0].set_title(f'Predict\nPSNR: {psnrRec:.2f}, SSIM: {ssimRec:.4f}')
         axes_comp[0].axis('off')
 
@@ -158,7 +186,7 @@ for idx, fname in enumerate(file_list_knee):
         cax0 = divider0.append_axes("right", size="5%", pad=0.05)
         fig_comp.colorbar(im_rec, cax=cax0)
 
-        im_gt = axes_comp[1].imshow(normOrg, cmap='gray', vmin=0, vmax=1)
+        im_gt = axes_comp[1].imshow(normOrg, cmap='gray', vmin=0, vmax=1 if vol_max is None else normOrg.max())
         axes_comp[1].set_title('True')
         axes_comp[1].axis('off')
 
@@ -167,7 +195,7 @@ for idx, fname in enumerate(file_list_knee):
         fig_comp.colorbar(im_gt, cax=cax1)
 
         error_map = np.abs(normOrg - normRec)
-        im_err = axes_comp[2].imshow(error_map, cmap='jet', vmin=0, vmax=0.1)
+        im_err = axes_comp[2].imshow(error_map, cmap='jet', vmin=0, vmax=0.1 if vol_max is None else 0.1*normOrg.max())
         axes_comp[2].set_title('Error')
         axes_comp[2].axis('off')
 
@@ -201,6 +229,15 @@ for idx, fname in enumerate(file_list_knee):
         plt.tight_layout()
         plt.savefig(os.path.join(experiment_dir, f'{base_name}_coils_csm.png'), dpi=300)
         plt.close(fig_csm)
+
+        fig_mask = plt.figure(figsize=(5, 5))
+        plt.imshow(SamMask[:, :, 0], cmap='gray', vmin=0, vmax=1)
+        plt.title('Sampling Mask')
+        plt.axis('off')
+        plt.savefig(os.path.join(experiment_dir, f'{base_name}_mask.png'), dpi=300, bbox_inches='tight',
+                    pad_inches=0.05)
+        plt.close(fig_mask)
+
     except Exception as e:
         print(f"Error processing {fname}: {e}")
         continue
