@@ -34,6 +34,10 @@ DEVICE = torch.device('cuda:{}'.format(str(0) if torch.cuda.is_available() else 
 data_root = '/data0/shanghong/data/fastmri_knee_mc/multicoil_train/'
 
 file_list_knee = [
+    'file1000003.h5', 'file1000005.h5',
+]
+"""
+file_list_knee = [
     'file1000003.h5', 'file1000005.h5', 'file1000010.h5', 'file1000012.h5',
     'file1000021.h5', 'file1000032.h5', 'file1000040.h5', 'file1000043.h5',
     'file1000045.h5', 'file1000048.h5', 'file1000058.h5', 'file1000061.h5',
@@ -43,8 +47,7 @@ file_list_knee = [
     'file1000149.h5', 'file1000170.h5', 'file1000172.h5', 'file1000176.h5'
 
 ]
-
-
+"""
 file_paths = [os.path.join(data_root, f) for f in file_list_knee]
 print(f"Total files to process: {len(file_paths)}")
 current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -164,9 +167,13 @@ for idx, fname in enumerate(file_list_knee):
             normOrg = fn(gt)
             normRec = fn(pre_img_sos)
 
+        recon_restored = pre_img_sos * NormFactor
+        print(recon_restored.max())
+        gt_restored = gt
+        print(gt.max())
         #psnrRec = utils.myPSNR(normOrg, normRec)
-        psnrRec = compute_psnr(normOrg, normRec, data_range=1)
-        ssimRec = compute_ssim(normRec, normOrg, data_range=1, gaussian_weights=True)
+        psnrRec = utils.myPSNR(gt_restored, recon_restored)
+        ssimRec = compute_ssim(recon_restored, gt_restored, data_range=vol_max)
         nmseRec = np.sum((normOrg - normRec) ** 2) / np.sum(normOrg ** 2)
 
         psnr_list.append(psnrRec)
