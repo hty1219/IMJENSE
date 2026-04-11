@@ -29,31 +29,93 @@ DEVICE = torch.device('cuda:{}'.format(str(0) if torch.cuda.is_available() else 
 
 #data_root = '/data0/shanghong/data/fastmri_knee_mc/multicoil_train/'
 #data_root = '/data1/zijian/data/stanford3dcor_tiny/test'
-data_root = '/data1/zijian/data/aheadax_e5_tiny/test'
+data_root = '/data0/shanghong/data/fastmri_knee_mc/multicoil_val1'
+
+RUN_MODE = 'full'  # 'full' runs all slices; 'benchmark' uses warmup/timed slices only
+BATCH_SIZE = 1
+SAVE_VISUAL_RESULTS = False
+WARMUP_SLICES = 10
+TIMED_SLICES = 100
+VALID_RUN_MODES = ('full', 'benchmark')
+if RUN_MODE not in VALID_RUN_MODES:
+    raise ValueError(f"RUN_MODE must be one of {VALID_RUN_MODES}, got {RUN_MODE}")
+TOTAL_RECON_SLICES = WARMUP_SLICES + TIMED_SLICES if RUN_MODE == 'benchmark' else None
+SUPPORTED_PATTERNS = ('*.h5', '*.npy')
+
+
+def synchronize_for_timing():
+    if DEVICE.type == 'cuda' and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def load_kspace_volume(fpath):
+    ext = os.path.splitext(fpath)[1].lower()
+
+    if ext == '.h5':
+        with h5.File(fpath, 'r') as f:
+            vol_max = f.attrs.get('max')
+            if vol_max is None:
+                vol_max = f['max'][()] if 'max' in f else None
+
+            if 'KspOrg' in f:
+                return f['KspOrg'][:], vol_max
+            if 'kspace' in f:
+                return f['kspace'][:], vol_max
+
+        raise KeyError("No 'KspOrg' or 'kspace' key found.")
+
+    if ext == '.npy':
+        kspace_vol = np.load(fpath)
+        if kspace_vol.ndim == 3:
+            return kspace_vol[None, ...], None
+        if kspace_vol.ndim == 4:
+            return kspace_vol, None
+        raise ValueError(f"Unexpected npy shape: {kspace_vol.shape}")
+
+    raise ValueError(f"Unsupported file extension: {ext}")
 
 
 print("正在读取文件列表...")
-file_list_paths = glob.glob(os.path.join(data_root, '*.h5'))
+file_list_paths = []
+for pattern in SUPPORTED_PATTERNS:
+    file_list_paths.extend(glob.glob(os.path.join(data_root, pattern)))
+file_list_paths = sorted(file_list_paths)
 #file_list_knee = [os.path.basename(p) for p in file_list_paths[:1]]
 file_list_knee = [os.path.basename(p) for p in file_list_paths]
 
-current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-experiment_dir = os.path.join('./results_experiments', f'exp_FULL_{current_time}')
-if not os.path.exists(experiment_dir):
-    os.makedirs(experiment_dir)
+experiment_dir = None
+if SAVE_VISUAL_RESULTS:
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_dir = os.path.join('./results_experiments', f'exp_FULL_{current_time}')
+    if not os.path.exists(experiment_dir):
+        os.makedirs(experiment_dir)
+    print(f"Results will be saved to: {experiment_dir}")
+else:
+    print("Visual results will not be saved.")
 
-print(f"Results will be saved to: {experiment_dir}")
+print(f"Batch size used for timing: {BATCH_SIZE}")
+print(f"Run mode: {RUN_MODE}")
+if RUN_MODE == 'benchmark':
+    print(f"Warmup slices: {WARMUP_SLICES}")
+    print(f"Timed slices: {TIMED_SLICES}")
+    print(f"Total slices to reconstruct before stopping: {TOTAL_RECON_SLICES}")
+else:
+    print("Full dataset mode is enabled. All discovered slices will be reconstructed.")
 print(f"Total files found: {len(file_list_knee)}")
 
 psnr_list = []
 ssim_list = []
 nmse_list = []
+recon_time_list = []
 
 
 total_slices_processed = 0
 file_slice_stats = {}
 
 for file_idx, fname in enumerate(file_list_knee):
+    if TOTAL_RECON_SLICES is not None and total_slices_processed >= TOTAL_RECON_SLICES:
+        break
+
     fpath = os.path.join(data_root, fname)
     print(f"\n[{file_idx + 1}/{len(file_list_knee)}] Reading File: {fname}")
 
@@ -63,26 +125,16 @@ for file_idx, fname in enumerate(file_list_knee):
 
     try:
         # Load data
-        f = h5.File(fpath, 'r')
-
-        vol_max = f.attrs.get('max')
-        if vol_max is None:
-            vol_max = f['max'][()] if 'max' in f else None
-
-        if 'KspOrg' in f:
-            kspace_vol = f['KspOrg'][:]
-        elif 'kspace' in f:
-            kspace_vol = f['kspace'][:]
-        else:
-            print(f"Skipping {fname}: No 'KspOrg' or 'kspace' key found.")
-            f.close()
-            continue
+        kspace_vol, vol_max = load_kspace_volume(fpath)
 
         n_slices = kspace_vol.shape[0]
-        file_slice_stats[fname] = n_slices  # 记录统计信息
+        file_slice_stats[fname] = n_slices
         print(f"  -> Found {n_slices} slices in {fname}")
 
         for slice_idx in range(n_slices):
+            if TOTAL_RECON_SLICES is not None and total_slices_processed >= TOTAL_RECON_SLICES:
+                break
+
             print(f"    Processing Slice {slice_idx + 1}/{n_slices} (Total Processed: {total_slices_processed + 1})")
 
             data_cpl = kspace_vol[slice_idx]
@@ -152,14 +204,25 @@ for file_idx, fname in enumerate(file_list_knee):
             NormFactor = np.max(np.sqrt(np.sum(np.abs(zf_coil_img) ** 2, axis=2)))
             tstDsKsp = tstDsKsp / NormFactor
 
-            # Reconstruction
-            # time_start = time.time()
+            is_warmup_slice = RUN_MODE == 'benchmark' and total_slices_processed < WARMUP_SLICES
+
+            # Reconstruction timing only covers the IMJENSE optimization itself.
+            synchronize_for_timing()
+            recon_start = time.perf_counter()
             pre_img, pre_tstCsm, pre_img_dc, pre_img_sos, pre_ksp = IMJENSE.IMJENSE_Recon(
                 tstDsKsp, SamMask, DEVICE, w0=w0, TV_weight=lamda, PolyOrder=15,
                 MaxIter=1500, LrImg=1e-4, LrCsm=0.1
             )
-            # time_end = time.time()
-            # print(f'      Recon time: {(time_end - time_start) / 60:.2f} mins')
+            synchronize_for_timing()
+            recon_time = time.perf_counter() - recon_start
+            if is_warmup_slice:
+                print(f'      Warmup slice {total_slices_processed + 1}/{WARMUP_SLICES}: {recon_time:.4f} s (not counted)')
+            else:
+                recon_time_list.append(recon_time)
+                if RUN_MODE == 'benchmark':
+                    print(f'      Timed slice {len(recon_time_list)}/{TIMED_SLICES}: {recon_time:.4f} s')
+                else:
+                    print(f'      Pure recon time: {recon_time:.4f} s')
 
             if vol_max is not None:
                 # normOrg = np.abs(gt) / vol_max
@@ -180,91 +243,95 @@ for file_idx, fname in enumerate(file_list_knee):
             recon_restored = mridataset.center_crop(recon_restored, (metric_h, metric_w))
             print(f"Shape after cropping black border: {gt_restored.shape, recon_restored.shape}")
             # Compute Metrics
-            psnrRec = compute_psnr(gt_restored, recon_restored, data_range=vol_max)
-            ssimRec = compute_ssim(gt_restored, recon_restored, data_range=vol_max)
+            metric_data_range = vol_max
+            if metric_data_range is None:
+                metric_data_range = gt_restored.max() - gt_restored.min()
+                if metric_data_range <= 0:
+                    metric_data_range = 1.0
+
+            psnrRec = compute_psnr(gt_restored, recon_restored, data_range=metric_data_range)
+            ssimRec = compute_ssim(gt_restored, recon_restored, data_range=metric_data_range)
             nmseRec = np.linalg.norm(gt_restored - recon_restored) ** 2 / np.linalg.norm(gt_restored) ** 2
 
-            psnr_list.append(psnrRec)
-            ssim_list.append(ssimRec)
-            nmse_list.append(nmseRec)
+            if not is_warmup_slice:
+                psnr_list.append(psnrRec)
+                ssim_list.append(ssimRec)
+                nmse_list.append(nmseRec)
 
             print(f'      Slice {slice_idx} -> PSNR: {psnrRec:.4f}, SSIM: {ssimRec:.4f}, NMSE: {nmseRec:.4f}')
 
-            # --- Save Results (Modified Naming) ---
-            base_name = os.path.splitext(fname)[0]
-            folder_name = f"{base_name}_slice{slice_idx:03d}_PSNR{psnrRec:.2f}_SSIM{ssimRec:.4f}_NMSE{nmseRec:.4f}"
-            current_slice_dir = os.path.join(experiment_dir, folder_name)
+            if SAVE_VISUAL_RESULTS and not is_warmup_slice:
+                base_name = os.path.splitext(fname)[0]
+                folder_name = f"{base_name}_slice{slice_idx:03d}_PSNR{psnrRec:.2f}_SSIM{ssimRec:.4f}_NMSE{nmseRec:.4f}"
+                current_slice_dir = os.path.join(experiment_dir, folder_name)
 
-            if not os.path.exists(current_slice_dir):
-                os.makedirs(current_slice_dir)
+                if not os.path.exists(current_slice_dir):
+                    os.makedirs(current_slice_dir)
 
-            # 1. Comparison Plot
-            fig_comp, axes_comp = plt.subplots(3, 1, figsize=(6, 15))
-            im_rec = axes_comp[1].imshow(recon_restored, cmap='gray', vmin=0,
-                                         vmax=1 if vol_max is None else gt_restored.max())
-            axes_comp[1].set_title(f'Predict (Slice {slice_idx})')
-            axes_comp[1].axis('off')
+                # 1. Comparison Plot
+                fig_comp, axes_comp = plt.subplots(3, 1, figsize=(6, 15))
+                im_rec = axes_comp[1].imshow(recon_restored, cmap='gray', vmin=0,
+                                             vmax=1 if vol_max is None else gt_restored.max())
+                axes_comp[1].set_title(f'Predict (Slice {slice_idx})')
+                axes_comp[1].axis('off')
 
-            divider0 = make_axes_locatable(axes_comp[1])
-            cax0 = divider0.append_axes("right", size="5%", pad=0.05)
-            fig_comp.colorbar(im_rec, cax=cax0)
+                divider0 = make_axes_locatable(axes_comp[1])
+                cax0 = divider0.append_axes("right", size="5%", pad=0.05)
+                fig_comp.colorbar(im_rec, cax=cax0)
 
-            im_gt = axes_comp[0].imshow(gt_restored, cmap='gray', vmin=0,
-                                        vmax=1 if vol_max is None else gt_restored.max())
-            axes_comp[0].set_title(f'True (Slice {slice_idx})')
-            axes_comp[0].axis('off')
+                im_gt = axes_comp[0].imshow(gt_restored, cmap='gray', vmin=0,
+                                            vmax=1 if vol_max is None else gt_restored.max())
+                axes_comp[0].set_title(f'True (Slice {slice_idx})')
+                axes_comp[0].axis('off')
 
-            divider1 = make_axes_locatable(axes_comp[0])
-            cax1 = divider1.append_axes("right", size="5%", pad=0.05)
-            fig_comp.colorbar(im_gt, cax=cax1)
+                divider1 = make_axes_locatable(axes_comp[0])
+                cax1 = divider1.append_axes("right", size="5%", pad=0.05)
+                fig_comp.colorbar(im_gt, cax=cax1)
 
-            error_map = np.abs(gt_restored - recon_restored)
-            im_err = axes_comp[2].imshow(error_map, cmap='jet', vmin=0,
-                                         vmax=0.1 if vol_max is None else 0.1 * gt_restored.max())
-            axes_comp[2].set_title('Error')
-            axes_comp[2].axis('off')
+                error_map = np.abs(gt_restored - recon_restored)
+                im_err = axes_comp[2].imshow(error_map, cmap='jet', vmin=0,
+                                             vmax=0.1 if vol_max is None else 0.1 * gt_restored.max())
+                axes_comp[2].set_title('Error')
+                axes_comp[2].axis('off')
 
-            divider2 = make_axes_locatable(axes_comp[2])
-            cax2 = divider2.append_axes("right", size="5%", pad=0.05)
-            fig_comp.colorbar(im_err, cax=cax2)
+                divider2 = make_axes_locatable(axes_comp[2])
+                cax2 = divider2.append_axes("right", size="5%", pad=0.05)
+                fig_comp.colorbar(im_err, cax=cax2)
 
-            plt.tight_layout()
-            plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_comparison.png'), dpi=300)
-            plt.close(fig_comp)
+                plt.tight_layout()
+                plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_comparison.png'), dpi=300)
+                plt.close(fig_comp)
 
-            # 2. Sensitivity Maps Plot (Only process if needed, skip to save time if many coils)
-            n_channels = pre_tstCsm.shape[2]
-            grid_side = math.ceil(math.sqrt(n_channels))
-            fig_csm, axes_csm = plt.subplots(grid_side, grid_side, figsize=(12, 12))
-            axes_csm = axes_csm.flatten()
+                # 2. Sensitivity Maps Plot (Only process if needed, skip to save time if many coils)
+                n_channels = pre_tstCsm.shape[2]
+                grid_side = math.ceil(math.sqrt(n_channels))
+                fig_csm, axes_csm = plt.subplots(grid_side, grid_side, figsize=(12, 12))
+                axes_csm = axes_csm.flatten()
 
-            for i in range(grid_side * grid_side):
-                if i < n_channels:
-                    coil_img = np.abs(pre_tstCsm[:, :, i])
-                    if np.max(coil_img) > 0:
-                        coil_img = coil_img / np.max(coil_img)
-                    axes_csm[i].imshow(coil_img, cmap='jet')
-                    axes_csm[i].set_title(f'Coil {i + 1}', fontsize=8)
-                axes_csm[i].axis('off')
+                for i in range(grid_side * grid_side):
+                    if i < n_channels:
+                        coil_img = np.abs(pre_tstCsm[:, :, i])
+                        if np.max(coil_img) > 0:
+                            coil_img = coil_img / np.max(coil_img)
+                        axes_csm[i].imshow(coil_img, cmap='jet')
+                        axes_csm[i].set_title(f'Coil {i + 1}', fontsize=8)
+                    axes_csm[i].axis('off')
 
-            fig_csm.suptitle(f'Sensitivity Maps (Slice {slice_idx})', fontsize=16)
-            plt.tight_layout()
-            plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_coils_csm.png'), dpi=300)
-            plt.close(fig_csm)
+                fig_csm.suptitle(f'Sensitivity Maps (Slice {slice_idx})', fontsize=16)
+                plt.tight_layout()
+                plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_coils_csm.png'), dpi=300)
+                plt.close(fig_csm)
 
-            # 3. Mask Plot
-            fig_mask = plt.figure(figsize=(5, 5))
-            plt.imshow(SamMask[:, :, 0], cmap='gray', vmin=0, vmax=1)
-            plt.title('Sampling Mask')
-            plt.axis('off')
-            plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_mask.png'), dpi=300,
-                        bbox_inches='tight', pad_inches=0.05)
-            plt.close(fig_mask)
+                # 3. Mask Plot
+                fig_mask = plt.figure(figsize=(5, 5))
+                plt.imshow(SamMask[:, :, 0], cmap='gray', vmin=0, vmax=1)
+                plt.title('Sampling Mask')
+                plt.axis('off')
+                plt.savefig(os.path.join(current_slice_dir, f'{base_name}_slice{slice_idx:03d}_mask.png'), dpi=300,
+                            bbox_inches='tight', pad_inches=0.05)
+                plt.close(fig_mask)
 
             total_slices_processed += 1
-
-        # Close file after processing all slices
-        f.close()
 
     except Exception as e:
         print(f"Error processing {fname}: {e}")
@@ -273,12 +340,26 @@ for file_idx, fname in enumerate(file_list_knee):
         traceback.print_exc()
         continue
 
-# --- 修改 4: 最终统计报告 ---
 print("\n" + "=" * 50)
 print("EXPERIMENT COMPLETE")
 print(f"Total Files Scanned: {len(file_list_knee)}")
-print(f"Total Slices Processed: {total_slices_processed}")
+print(f"Total Slices Reconstructed: {total_slices_processed}")
+if RUN_MODE == 'benchmark':
+    print(f"Warmup Slices Used: {min(total_slices_processed, WARMUP_SLICES)}")
+    print(f"Timed Slices Used: {len(recon_time_list)}")
 print("-" * 50)
+if len(recon_time_list) > 0:
+    avg_recon_time = np.mean(recon_time_list)
+    std_recon_time = np.std(recon_time_list)
+    print("Pure Reconstruction Timing:")
+    print(f"  Batch size: {BATCH_SIZE}")
+    if RUN_MODE == 'benchmark':
+        print(f"  Warmup slices: {WARMUP_SLICES}")
+    print(f"  Total measured data: {len(recon_time_list)}")
+    print(f"  Average inference time: {avg_recon_time:.4f} +/- {std_recon_time:.4f} s")
+    print(f"  Average inference time: {avg_recon_time / 60:.4f} +/- {std_recon_time / 60:.4f} min")
+    print("-" * 50)
+
 print("Slice Counts Per File:")
 for name, count in file_slice_stats.items():
     print(f"  {name}: {count} slices")
@@ -293,7 +374,8 @@ if len(psnr_list) > 0:
     std_ssim = np.std(ssim_list)
     std_nmse = np.std(nmse_list)
 
-    print(f"Metrics (Average over {len(psnr_list)} slices):")
+    metric_label = "timed slices" if RUN_MODE == 'benchmark' else "processed slices"
+    print(f"Metrics (Average over {len(psnr_list)} {metric_label}):")
     print(f"  Average PSNR: {avg_psnr:.5f} ± {std_psnr:.5f}")
     print(f"  Average SSIM: {avg_ssim:.5f} ± {std_ssim:.5f}")
     print(f"  Average NMSE: {avg_nmse:.5f} ± {std_nmse:.5f}")

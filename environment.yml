@@ -1,0 +1,20 @@
+name: imjense-up
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.9.7
+  - pytorch=1.13.1
+  - torchvision=0.14.1
+  - torchaudio=0.13.1
+  - pytorch-cuda=11.7
+  - numpy=1.26.4
+  - h5py=3.14.0
+  - scipy=1.13.1
+  - scikit-image=0.24.0
+  - matplotlib=3.9.4
+  - scikit-learn=1.6.1
+  - tqdm=4.67.1
+  - tensorboard=2.19.0
